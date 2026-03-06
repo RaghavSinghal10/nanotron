@@ -8,6 +8,7 @@ torchrun --nproc_per_node=8 run_train.py --config-file examples/config_tiny_llam
 ```
 """
 import argparse
+import os
 import time
 from pprint import pformat
 from typing import Dict, Optional, cast
@@ -190,6 +191,14 @@ def get_dataloader_from_data_stage(
         log_rank("Using TokenizedBytes Dataloader", logger=logger, level=logging.INFO, rank=0)
         from nanotron.data.tokenized_bytes import get_tb_dataloader, get_tb_datasets
 
+        if trainer.config.sdsp is not None:
+            if not isinstance(trainer.model_config, Qwen2Config):
+                raise ValueError("SDSP is only implemented for Qwen2 training models")
+            if not data.dataset.return_positions:
+                raise ValueError("SDSP requires dataset.return_positions=true")
+            if not getattr(trainer.model_config, "_use_doc_masking", False):
+                raise ValueError("SDSP requires model_config._use_doc_masking=true")
+
         tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         assert (
@@ -236,6 +245,12 @@ def get_dataloader_from_data_stage(
             dataloader_pin_memory=True,
             use_position_ids=isinstance(trainer.model_config, Qwen2Config),
             use_doc_masking=getattr(trainer.model_config, "_use_doc_masking", None),
+            sdsp_args=trainer.config.sdsp,
+            tokenizer_name_or_path=tokenizer_path,
+            eos_token_id=tokenizer.eos_token_id,
+            split_feedback_loss_logging=os.environ.get("SPLIT_FEEDBACK_LOSS_LOGGING", "0") == "1",
+            feedback_open_tag=os.environ.get("FEEDBACK_OPEN_TAG", "<assistant>"),
+            feedback_close_tag=os.environ.get("FEEDBACK_CLOSE_TAG", "</assistant>"),
         )
         log_rank(
             f"[TokenizedBytes] Time taken to create TokenizedBytes: {time.strftime('%M:%S', time.gmtime(time.time() - start_time))} (MM:SS)",

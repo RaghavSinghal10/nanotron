@@ -351,6 +351,25 @@ class TokensArgs:
 
 
 @dataclass
+class SDSPArgs:
+    alpha: float
+    kl_top_k: int = 200
+    feedback_open_tag: str = "<assistant>"
+    feedback_close_tag: str = "</assistant>"
+    strip_single_newline_after_feedback: bool = True
+
+    def __post_init__(self):
+        if self.alpha < 0:
+            raise ValueError(f"sdsp.alpha must be >= 0, got {self.alpha}")
+        if self.kl_top_k <= 0:
+            raise ValueError(f"sdsp.kl_top_k must be > 0, got {self.kl_top_k}")
+        if not self.feedback_open_tag:
+            raise ValueError("sdsp.feedback_open_tag must be non-empty")
+        if not self.feedback_close_tag:
+            raise ValueError("sdsp.feedback_close_tag must be non-empty")
+
+
+@dataclass
 class LRSchedulerArgs:
     """Arguments related to the learning rate scheduler
 
@@ -451,6 +470,7 @@ class Config:
     metrics_logging: Optional[MetricsLoggingArgs] = None
     tokens: Optional[TokensArgs] = None
     optimizer: Optional[OptimizerArgs] = None
+    sdsp: Optional[SDSPArgs] = None
     data_stages: Optional[List[DatasetStageArgs]] = None
     profiler: Optional[ProfilerArgs] = None
     lighteval: Optional[LightEvalConfig] = None
@@ -462,6 +482,7 @@ class Config:
         return cls(**{f.name: None for f in cls_fields})
 
     def __post_init__(self):
+        setattr(self.model.model_config, "sdsp", self.sdsp)
 
         if self.s3_upload is not None:
             self.s3_upload.__post_init__()

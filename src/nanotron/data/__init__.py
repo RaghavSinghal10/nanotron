@@ -1,4 +1,8 @@
-from nanotron.data.clm_collator import DataCollatorForCLM, DataCollatorForCLMWithPositionIds
+from nanotron.data.clm_collator import (
+    DataCollatorForCLM,
+    DataCollatorForCLMWithPositionIds,
+    DataCollatorForSDSPWithPositionIds,
+)
 from nanotron.data.dataloader import (
     dummy_infinite_data_generator,
     get_train_dataloader,
@@ -12,6 +16,7 @@ from nanotron.data.sft_processing import prepare_sft_dataset, process_sft
 __all__ = [
     "DataCollatorForCLM",
     "DataCollatorForCLMWithPositionIds",
+    "DataCollatorForSDSPWithPositionIds",
     "dummy_infinite_data_generator",
     "get_train_dataloader",
     "sanity_check_dataloader",

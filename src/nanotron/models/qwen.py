@@ -1,3 +1,4 @@
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -9,7 +10,7 @@ from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import Config, ParallelismArgs
 from nanotron.config.models_config import Qwen2Config, RandomInit, SpectralMupInit
-from nanotron.logging import log_rank
+from nanotron.logging import LogMixin, LoggingCollectorMixin, log_rank
 from nanotron.models import NanotronModel
 from nanotron.nn.activations import ACT2FN
 from nanotron.nn.attention import ALL_ATTENTION_FUNCTIONS, get_attention_mask
@@ -29,7 +30,6 @@ from nanotron.parallel.tensor_parallel.nn import (
 )
 from nanotron.random import RandomStates
 from nanotron.scaling.parametrization import SpectralMupParametrizator, StandardParametrizator
-from nanotron.logging import LogMixin
 from nanotron.nn.llama3_ring_attention import llama3_flash_attn_varlen_kvpacked_func, llama3_flash_attn_prepare_cu_seqlens
 logger = logging.get_logger(__name__)
 
@@ -856,20 +856,201 @@ def masked_mean(loss, label_mask, dtype):
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
-class Loss(nn.Module):
+def masked_mean_or_zero(loss: torch.Tensor, label_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    denom = label_mask.sum().clamp_min(1).to(dtype=dtype)
+    return (loss * label_mask).sum(dtype=dtype) / denom
+
+
+def scalar_log_tensor(value: torch.Tensor) -> torch.Tensor:
+    return value.detach().reshape(1)
+
+
+def _trim_true_mask(mask: torch.Tensor, keep_count: int) -> torch.Tensor:
+    if keep_count <= 0:
+        return torch.zeros_like(mask, dtype=torch.bool)
+
+    current_count = int(mask.sum().item())
+    if current_count <= keep_count:
+        return mask
+
+    trimmed = torch.zeros_like(mask, dtype=torch.bool)
+    true_indices = torch.nonzero(mask.reshape(-1), as_tuple=False).flatten()[:keep_count]
+    trimmed.reshape(-1)[true_indices] = True
+    return trimmed
+
+
+def _normalize_sdsp_pair_masks(
+    base_sdsp_pair_mask: torch.Tensor,
+    cond_sdsp_pair_mask: torch.Tensor,
+    base_label_mask: torch.Tensor,
+    cond_label_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    base_sdsp_pair_mask = base_sdsp_pair_mask & base_label_mask
+    cond_sdsp_pair_mask = cond_sdsp_pair_mask & cond_label_mask
+
+    base_pair_count = int(base_sdsp_pair_mask.sum().item())
+    cond_pair_count = int(cond_sdsp_pair_mask.sum().item())
+    if base_pair_count == cond_pair_count:
+        return base_sdsp_pair_mask, cond_sdsp_pair_mask
+
+    pair_count = min(base_pair_count, cond_pair_count)
+    return _trim_true_mask(base_sdsp_pair_mask, pair_count), _trim_true_mask(cond_sdsp_pair_mask, pair_count)
+
+
+def _sharded_logsumexp(sharded_logits: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    local_max = torch.max(sharded_logits, dim=-1).values
+    if group.size() > 1:
+        dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=group)
+    local_sum_exp = torch.exp(sharded_logits - local_max.unsqueeze(-1)).sum(dim=-1, dtype=torch.float)
+    if group.size() > 1:
+        dist.all_reduce(local_sum_exp, op=dist.ReduceOp.SUM, group=group)
+    return local_max.to(dtype=torch.float) + torch.log(local_sum_exp.clamp_min(1e-20))
+
+
+def _global_topk_indices_from_sharded_logits(
+    sharded_logits: torch.Tensor,
+    top_k: int,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    local_vocab = sharded_logits.shape[-1]
+    tp_size = group.size()
+    global_vocab = local_vocab * tp_size
+    effective_k = min(top_k, global_vocab)
+    local_k = min(effective_k, local_vocab)
+
+    local_topk_logits, local_topk_indices = torch.topk(sharded_logits, k=local_k, dim=-1)
+    global_rank = dist.get_rank(group)
+    local_topk_indices = local_topk_indices + global_rank * local_vocab
+
+    if tp_size == 1:
+        return local_topk_indices
+
+    gathered_logits = [torch.empty_like(local_topk_logits) for _ in range(tp_size)]
+    gathered_indices = [torch.empty_like(local_topk_indices) for _ in range(tp_size)]
+    dist.all_gather(gathered_logits, local_topk_logits, group=group)
+    dist.all_gather(gathered_indices, local_topk_indices, group=group)
+
+    candidate_logits = torch.cat(gathered_logits, dim=-1)
+    candidate_indices = torch.cat(gathered_indices, dim=-1)
+    _, candidate_topk_positions = torch.topk(candidate_logits, k=effective_k, dim=-1)
+    return torch.gather(candidate_indices, dim=-1, index=candidate_topk_positions)
+
+
+def _gather_selected_sharded_logits(
+    sharded_logits: torch.Tensor,
+    global_indices: torch.Tensor,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    local_vocab = sharded_logits.shape[-1]
+    global_rank = dist.get_rank(group)
+    start_idx = global_rank * local_vocab
+    end_idx = start_idx + local_vocab
+
+    owner_mask = (global_indices >= start_idx) & (global_indices < end_idx)
+    safe_local_indices = (global_indices - start_idx).clamp(min=0, max=local_vocab - 1)
+    local_selected = torch.gather(sharded_logits, dim=-1, index=safe_local_indices)
+
+    selected = torch.full_like(local_selected, fill_value=float("-inf"))
+    selected = torch.where(owner_mask, local_selected, selected)
+    if group.size() > 1:
+        dist.all_reduce(selected, op=dist.ReduceOp.MAX, group=group)
+    return selected
+
+
+def _approx_sdsp_kl_topk(
+    base_sharded_logits: torch.Tensor,
+    cond_sharded_logits: torch.Tensor,
+    top_k: int,
+    group: dist.ProcessGroup,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global_topk_indices = _global_topk_indices_from_sharded_logits(
+        sharded_logits=base_sharded_logits,
+        top_k=top_k,
+        group=group,
+    )
+
+    base_logsumexp = _sharded_logsumexp(base_sharded_logits, group=group)
+    cond_logsumexp = _sharded_logsumexp(cond_sharded_logits, group=group)
+
+    base_topk_logits = _gather_selected_sharded_logits(
+        sharded_logits=base_sharded_logits,
+        global_indices=global_topk_indices,
+        group=group,
+    )
+    cond_topk_logits = _gather_selected_sharded_logits(
+        sharded_logits=cond_sharded_logits,
+        global_indices=global_topk_indices,
+        group=group,
+    )
+
+    base_topk_log_probs = base_topk_logits.to(dtype=torch.float) - base_logsumexp.unsqueeze(-1)
+    cond_topk_log_probs = (cond_topk_logits.to(dtype=torch.float) - cond_logsumexp.unsqueeze(-1)).detach()
+    base_topk_probs = torch.exp(base_topk_log_probs)
+    cond_topk_probs = torch.exp(cond_topk_log_probs)
+
+    topk_kl = (base_topk_probs * (base_topk_log_probs - cond_topk_log_probs)).sum(dim=-1)
+
+    local_vocab = base_sharded_logits.shape[-1]
+    global_vocab = local_vocab * group.size()
+    effective_k = min(top_k, global_vocab)
+    if effective_k == global_vocab:
+        return topk_kl, base_topk_probs.sum(dim=-1)
+
+    eps = 1e-8
+    base_topk_mass = base_topk_probs.sum(dim=-1).clamp(min=0.0, max=1.0 - eps)
+    cond_topk_mass = cond_topk_probs.sum(dim=-1).clamp(min=0.0, max=1.0 - eps).detach()
+    base_tail_mass = (1.0 - base_topk_mass).clamp(min=eps)
+    cond_tail_mass = (1.0 - cond_topk_mass).clamp(min=eps)
+    tail_kl = base_tail_mass * (torch.log(base_tail_mass) - torch.log(cond_tail_mass))
+
+    return topk_kl + tail_kl, base_topk_mass
+
+
+class Loss(LogMixin, nn.Module):
     def __init__(self, tp_pg: dist.ProcessGroup):
         super().__init__()
         self.tp_pg = tp_pg
+
+    def _log_split_losses(
+        self,
+        token_nll: torch.Tensor,
+        label_mask: torch.Tensor,
+        text_label_mask: Optional[torch.Tensor],
+        reflection_label_mask: Optional[torch.Tensor],
+    ) -> None:
+        if text_label_mask is None or reflection_label_mask is None:
+            return
+
+        text_mask = text_label_mask & label_mask
+        reflection_mask = reflection_label_mask & label_mask
+        text_loss = masked_mean_or_zero(token_nll, text_mask, dtype=torch.float)
+        reflection_loss = masked_mean_or_zero(token_nll, reflection_mask, dtype=torch.float)
+        self.tbi_logger(
+            {
+                "text_loss": scalar_log_tensor(text_loss),
+                "reflection_loss": scalar_log_tensor(reflection_loss),
+                "text_token_count": scalar_log_tensor(text_mask.sum().to(dtype=torch.float)),
+                "reflection_token_count": scalar_log_tensor(reflection_mask.sum().to(dtype=torch.float)),
+            }
+        )
 
     def forward(
         self,
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        text_label_mask: Optional[torch.Tensor] = None,
+        reflection_label_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
-        loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
-        loss = masked_mean(loss, label_mask, dtype=torch.float)
+        token_nll = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
+        loss = masked_mean(token_nll, label_mask, dtype=torch.float)
+        self._log_split_losses(
+            token_nll=token_nll,
+            label_mask=label_mask,
+            text_label_mask=text_label_mask,
+            reflection_label_mask=reflection_label_mask,
+        )
         return {"loss": loss}
 
 
@@ -883,16 +1064,100 @@ class LossWithZLoss(Loss):
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        text_label_mask: Optional[torch.Tensor] = None,
+        reflection_label_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
-        loss, z_loss = sharded_cross_entropy(
+        token_nll, z_loss = sharded_cross_entropy(
             sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float, z_loss_coef=self.z_loss_coef
         )
-        loss = masked_mean(loss, label_mask, dtype=torch.float)
+        loss = masked_mean(token_nll, label_mask, dtype=torch.float)
         z_loss = masked_mean(z_loss.detach(), label_mask, dtype=torch.float)
+        self._log_split_losses(
+            token_nll=token_nll,
+            label_mask=label_mask,
+            text_label_mask=text_label_mask,
+            reflection_label_mask=reflection_label_mask,
+        )
         return {"loss": loss, "z_loss": z_loss}
 
-from nanotron.logging import LoggingCollectorMixin
+
+class SDSPLoss(LogMixin, nn.Module):
+    def __init__(self, tp_pg: dist.ProcessGroup, alpha: float, kl_top_k: int):
+        super().__init__()
+        self.tp_pg = tp_pg
+        self.alpha = alpha
+        self.kl_top_k = kl_top_k
+
+    def forward(
+        self,
+        base_sharded_logits: torch.Tensor,
+        cond_sharded_logits: torch.Tensor,
+        base_label_ids: torch.Tensor,
+        base_label_mask: torch.Tensor,
+        base_sdsp_pair_mask: torch.Tensor,
+        cond_label_ids: torch.Tensor,
+        cond_label_mask: torch.Tensor,
+        cond_sdsp_pair_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        base_sharded_logits = base_sharded_logits.view(base_label_ids.shape[0], base_label_ids.shape[1], -1)
+        cond_sharded_logits = cond_sharded_logits.view(cond_label_ids.shape[0], cond_label_ids.shape[1], -1)
+
+        base_sdsp_pair_mask, cond_sdsp_pair_mask = _normalize_sdsp_pair_masks(
+            base_sdsp_pair_mask=base_sdsp_pair_mask,
+            cond_sdsp_pair_mask=cond_sdsp_pair_mask,
+            base_label_mask=base_label_mask,
+            cond_label_mask=cond_label_mask,
+        )
+
+        base_nll = sharded_cross_entropy(
+            base_sharded_logits,
+            base_label_ids.contiguous(),
+            group=self.tp_pg,
+            dtype=torch.float,
+        )
+        ce_text_loss = masked_mean_or_zero(base_nll, base_label_mask, dtype=torch.float)
+        non_pair_mask = base_label_mask & (~base_sdsp_pair_mask)
+        non_pair_loss = masked_mean_or_zero(base_nll, non_pair_mask, dtype=torch.float)
+        pair_count = int(base_sdsp_pair_mask.sum().item())
+
+        if pair_count > 0:
+            base_pair_logits = base_sharded_logits[base_sdsp_pair_mask]
+            cond_pair_logits = cond_sharded_logits[cond_sdsp_pair_mask]
+            sdsp_token_kl, base_topk_mass = _approx_sdsp_kl_topk(
+                base_sharded_logits=base_pair_logits,
+                cond_sharded_logits=cond_pair_logits,
+                top_k=self.kl_top_k,
+                group=self.tp_pg,
+            )
+            sdsp_loss = sdsp_token_kl.mean(dtype=torch.float)
+            sdsp_topk_mass_mean = base_topk_mass.mean(dtype=torch.float)
+            sdsp_tail_mass_mean = (1.0 - base_topk_mass).mean(dtype=torch.float)
+        else:
+            zero = ce_text_loss.new_zeros(())
+            sdsp_loss = zero
+            sdsp_topk_mass_mean = zero
+            sdsp_tail_mass_mean = zero
+
+        loss = ce_text_loss + self.alpha * sdsp_loss
+
+        self.tbi_logger(
+            {
+                "ce_text_loss": scalar_log_tensor(ce_text_loss),
+                # `ntp_loss` is the plain next-token-prediction CE over all text tokens.
+                "ntp_loss": scalar_log_tensor(ce_text_loss),
+                "non_pair_loss": scalar_log_tensor(non_pair_loss),
+                "sdpo_loss": scalar_log_tensor(sdsp_loss),
+                "lm_loss": scalar_log_tensor(loss),
+                "sdsp_topk_mass_mean": scalar_log_tensor(sdsp_topk_mass_mean),
+                "sdsp_tail_mass_mean": scalar_log_tensor(sdsp_tail_mass_mean),
+                "sdsp_paired_token_count": scalar_log_tensor(base_sdsp_pair_mask.sum().to(dtype=torch.float)),
+            }
+        )
+
+        return {"loss": loss}
+
+
 class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
     def __init__(
         self,
@@ -903,49 +1168,136 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
     ):
         super().__init__()
         self.model = Qwen2Model(config=config, parallel_context=parallel_context, parallel_config=parallel_config)
+        self.sdsp = getattr(config, "sdsp", None)
+        self.split_feedback_loss_logging = os.environ.get("SPLIT_FEEDBACK_LOSS_LOGGING", "0") == "1"
 
         # Choose the appropriate loss class based on config
         loss_kwargs = {
             "tp_pg": parallel_context.tp_pg,
         }
+        if self.sdsp is not None and config.z_loss_enabled:
+            raise ValueError("SDSP and z-loss cannot be enabled together in Qwen2ForTraining")
+
         if config.z_loss_enabled:
             loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
 
-        self.loss = PipelineBlock(
-            p2p=self.model.p2p,
-            module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
-            module_kwargs=loss_kwargs,
-            module_input_keys={
+        if self.sdsp is not None:
+            self.loss = PipelineBlock(
+                p2p=self.model.p2p,
+                module_builder=SDSPLoss,
+                module_kwargs={
+                    "tp_pg": parallel_context.tp_pg,
+                    "alpha": self.sdsp.alpha,
+                    "kl_top_k": self.sdsp.kl_top_k,
+                },
+                module_input_keys={
+                    "base_sharded_logits",
+                    "cond_sharded_logits",
+                    "base_label_ids",
+                    "base_label_mask",
+                    "base_sdsp_pair_mask",
+                    "cond_label_ids",
+                    "cond_label_mask",
+                    "cond_sdsp_pair_mask",
+                },
+                module_output_keys={"loss"},
+            )
+        else:
+            non_sdsp_loss_input_keys = {
                 "sharded_logits",
                 "label_ids",
                 "label_mask",
-            },
-            module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
-        )
+            }
+            if self.split_feedback_loss_logging:
+                non_sdsp_loss_input_keys |= {"text_label_mask", "reflection_label_mask"}
+            self.loss = PipelineBlock(
+                p2p=self.model.p2p,
+                module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
+                module_kwargs=loss_kwargs,
+                module_input_keys=non_sdsp_loss_input_keys,
+                module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
+            )
         self.parallel_context = parallel_context
         self.config = config
         self.parallel_config = parallel_config
 
     def forward(
         self,
-        input_ids: Union[torch.Tensor, TensorPointer],
-        position_ids: Union[torch.Tensor, TensorPointer],
-        label_ids: Union[torch.Tensor, TensorPointer],
-        label_mask: Union[torch.Tensor, TensorPointer],
+        input_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        position_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        label_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        label_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        base_input_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        base_position_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        base_label_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        base_label_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        base_sdsp_pair_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        cond_input_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        cond_position_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        cond_label_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        cond_label_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        cond_sdsp_pair_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        text_label_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        reflection_label_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        if self.sdsp is not None:
+            required_values = {
+                "base_input_ids": base_input_ids,
+                "base_position_ids": base_position_ids,
+                "base_label_ids": base_label_ids,
+                "base_label_mask": base_label_mask,
+                "base_sdsp_pair_mask": base_sdsp_pair_mask,
+                "cond_input_ids": cond_input_ids,
+                "cond_position_ids": cond_position_ids,
+                "cond_label_ids": cond_label_ids,
+                "cond_label_mask": cond_label_mask,
+                "cond_sdsp_pair_mask": cond_sdsp_pair_mask,
+            }
+            missing_keys = [key for key, value in required_values.items() if value is None]
+            if missing_keys:
+                raise ValueError(f"SDSP forward is missing required batch keys: {missing_keys}")
+
+            base_sharded_logits = self.model(
+                input_ids=base_input_ids,
+                position_ids=base_position_ids,
+            )
+            cond_sharded_logits = self.model(
+                input_ids=cond_input_ids,
+                position_ids=cond_position_ids,
+            )
+            loss = self.loss(
+                base_sharded_logits=base_sharded_logits,
+                cond_sharded_logits=cond_sharded_logits,
+                base_label_ids=base_label_ids,
+                base_label_mask=base_label_mask,
+                base_sdsp_pair_mask=base_sdsp_pair_mask,
+                cond_label_ids=cond_label_ids,
+                cond_label_mask=cond_label_mask,
+                cond_sdsp_pair_mask=cond_sdsp_pair_mask,
+            )
+            return {"loss": loss["loss"]}
+
         sharded_logits = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
         )
-        loss = self.loss(
-            sharded_logits=sharded_logits,
-            label_ids=label_ids,
-            label_mask=label_mask,
-        )
+        loss_inputs = {
+            "sharded_logits": sharded_logits,
+            "label_ids": label_ids,
+            "label_mask": label_mask,
+        }
+        if self.split_feedback_loss_logging:
+            if text_label_mask is None or reflection_label_mask is None:
+                raise ValueError(
+                    "split_feedback_loss_logging is enabled but text/reflection masks are missing from the batch"
+                )
+            loss_inputs["text_label_mask"] = text_label_mask
+            loss_inputs["reflection_label_mask"] = reflection_label_mask
+
+        loss = self.loss(**loss_inputs)
         if self.config.z_loss_enabled:
             return {"loss": loss["loss"], "z_loss": loss["z_loss"]}
-        else:
-            return {"loss": loss["loss"]}
+        return {"loss": loss["loss"]}
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):

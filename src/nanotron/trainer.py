@@ -603,7 +603,7 @@ class DistributedTrainer:
 
     def training_step(
         self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]
-    ) -> Tuple[Iterable[Dict], Optional[torch.Tensor]]:
+    ) -> Tuple[Iterable[Dict], Optional[torch.Tensor], Optional[torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         before_tbi_sanity_checks(
             self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator, self.lr_scheduler
         )
@@ -692,6 +692,7 @@ class DistributedTrainer:
                 z_loss_avg = None
             # sync loss across DP-CP (we should do the same for z_loss but it's only for logging so let's not sync it rn)
             handle = dist.all_reduce(loss_avg, group=self.parallel_context.dp_cp_pg, async_op=True, op=dist.ReduceOp.AVG)
+
         else:
             z_loss_avg = None
             loss_avg = None
@@ -860,6 +861,16 @@ class DistributedTrainer:
 
         if tbi_logs is not None:
             for name, tensor in tbi_logs.items():
+                # Expose main SDSP loss parts as top-level curves in WandB charts.
+                # Names may be namespaced (e.g. "loss.pp_block/ntp_loss"), so match suffix.
+                if name == "ntp_loss" or name.endswith("/ntp_loss"):
+                    basic_log_entries.append(LogItem("ntp_loss", tensor.mean().item(), "human_format"))
+                elif name == "sdpo_loss" or name.endswith("/sdpo_loss"):
+                    basic_log_entries.append(LogItem("sdpo_loss", tensor.mean().item(), "human_format"))
+                elif name == "text_loss" or name.endswith("/text_loss"):
+                    basic_log_entries.append(LogItem("text_loss", tensor.mean().item(), "human_format"))
+                elif name == "reflection_loss" or name.endswith("/reflection_loss"):
+                    basic_log_entries.append(LogItem("reflection_loss", tensor.mean().item(), "human_format"))
                 # attn_probs is [num_local_heads, mbs * seq_len]
                 basic_log_entries.append(LogItem(f"tbi_logs/{name}_mean", tensor.mean().item(), "human_format"))
                 basic_log_entries.append(LogItem(f"tbi_logs/{name}_std", tensor.std().item(), "human_format"))

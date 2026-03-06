@@ -184,10 +184,8 @@ class BlendableDataset(torch.utils.data.Dataset):
         """
         stats = {}
         for dataset_idx, dataset in enumerate(self.datasets):
-            assert (
-                "s3" in dataset.folder_path
-            ), "Only S3 paths are supported for consumption stats"  # TODO: remove this
-            stats[dataset.folder_path] = {"tokens": self.consumed_tokens[dataset_idx]}
+            dataset_path = getattr(dataset, "folder_path", f"dataset_{dataset_idx}")
+            stats[dataset_path] = {"tokens": self.consumed_tokens[dataset_idx]}
         return stats
 
 

@@ -1,3 +1,4 @@
+import inspect
 import torch
 from flash_attn.layers.rotary import apply_rotary_emb as flash_apply_rotary_emb
 from torch import nn
@@ -6,6 +7,9 @@ from einops import rearrange
 from nanotron import logging
 from nanotron.logging import warn_once
 logger = logging.get_logger(__name__)
+_FLASH_ROTARY_ACCEPTS_POS_IDX_IN_FP32 = (
+    "pos_idx_in_fp32" in inspect.signature(OrigFlashRotaryEmbedding.__init__).parameters
+)
 
 
 class RotaryEmbedding(nn.Module):
@@ -158,14 +162,24 @@ class FlashRotaryEmbedding(OrigFlashRotaryEmbedding):
         device=None,
         seq_len_interpolation_factor=None,
     ):
-        super().__init__(
-            dim,
-            base,
-            interleaved,
-            scale_base,
-            pos_idx_in_fp32,
-            device,
-        )
+        if _FLASH_ROTARY_ACCEPTS_POS_IDX_IN_FP32:
+            super().__init__(
+                dim,
+                base,
+                interleaved,
+                scale_base,
+                pos_idx_in_fp32,
+                device,
+            )
+        else:
+            super().__init__(
+                dim,
+                base,
+                interleaved,
+                scale_base,
+                device,
+            )
+            self.pos_idx_in_fp32 = pos_idx_in_fp32
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
 
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):

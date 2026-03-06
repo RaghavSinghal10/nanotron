@@ -14,7 +14,12 @@ from torch.utils.data import DataLoader, Dataset
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import NanosetDatasetsArgs
-from nanotron.data import DataCollatorForCLM, DataCollatorForCLMWithPositionIds, EmptyInfiniteDataset
+from nanotron.data import (
+    DataCollatorForCLM,
+    DataCollatorForCLMWithPositionIds,
+    DataCollatorForSDSPWithPositionIds,
+    EmptyInfiniteDataset,
+)
 from nanotron.data.dataloader import get_dataloader_worker_init
 from nanotron.data.nemo_dataset import BlendableDataset
 from nanotron.data.nemo_dataset.dataset_utils import compile_helper
@@ -665,6 +670,12 @@ def get_tb_dataloader(
     dataloader_pin_memory: bool = True,
     use_position_ids: bool = False,
     use_doc_masking: bool = False,
+    sdsp_args=None,
+    tokenizer_name_or_path: Optional[str] = None,
+    eos_token_id: Optional[int] = None,
+    split_feedback_loss_logging: bool = False,
+    feedback_open_tag: str = "<assistant>",
+    feedback_close_tag: str = "</assistant>",
 ) -> DataLoader:
     # Only some rank require to run the dataloader.
     if dist.get_rank(parallel_context.pp_pg) not in [
@@ -690,13 +701,32 @@ def get_tb_dataloader(
     )
 
     # We use the data collator to put the tensors on the right pipeline parallelism rank
-    if use_position_ids:
+    if sdsp_args is not None:
+        if tokenizer_name_or_path is None:
+            raise ValueError("tokenizer_name_or_path must be provided when SDSP is enabled")
+        data_collator = DataCollatorForSDSPWithPositionIds(
+            sequence_length=sequence_length,
+            input_pp_rank=input_pp_rank,
+            output_pp_rank=output_pp_rank,
+            parallel_context=parallel_context,
+            tokenizer_name_or_path=tokenizer_name_or_path,
+            feedback_open_tag=sdsp_args.feedback_open_tag,
+            feedback_close_tag=sdsp_args.feedback_close_tag,
+            strip_single_newline_after_feedback=sdsp_args.strip_single_newline_after_feedback,
+            eos_token_id=eos_token_id,
+        )
+    elif use_position_ids:
         data_collator = DataCollatorForCLMWithPositionIds(
             sequence_length=sequence_length,
             input_pp_rank=input_pp_rank,
             output_pp_rank=output_pp_rank,
             parallel_context=parallel_context,
             use_doc_masking=use_doc_masking,
+            eos_token_id=eos_token_id,
+            split_feedback_loss_logging=split_feedback_loss_logging,
+            tokenizer_name_or_path=tokenizer_name_or_path,
+            feedback_open_tag=feedback_open_tag,
+            feedback_close_tag=feedback_close_tag,
         )
     else:
         data_collator = DataCollatorForCLM(
