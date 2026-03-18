@@ -1063,6 +1063,7 @@ class LlamaForTraining(NanotronModel):
         input_mask: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        sample_dataset_index: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         sharded_logits = self.model(
             input_ids=input_ids,

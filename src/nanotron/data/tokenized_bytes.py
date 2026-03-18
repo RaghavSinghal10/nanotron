@@ -588,8 +588,21 @@ def get_tb_datasets(
             # warmup datasets
             estimate_current_sample = int(consumed_samples * weights[i]) + last_stages_consumed_samples_per_dataset_folder.get(dataset.folder_path, 0)
             _ = dataset[estimate_current_sample]
-            # print which file we're currently reading from
-            log_rank(f"Dataset {i} ({dataset.folder_path}) is reading from file {dataset.current_file_path}", logger=logger, level=logging.INFO, rank=0)
+            # print which file we're currently reading from (works for both old/new dataloaders)
+            current_file_path = getattr(dataset, "current_file_path", None)
+            if current_file_path is None:
+                current_file_idx = getattr(dataset, "current_file", None)
+                files = getattr(dataset, "files", None)
+                if isinstance(current_file_idx, int) and files and 0 <= current_file_idx < len(files):
+                    current_file_path = getattr(files[current_file_idx], "file_path", None)
+            if current_file_path is None:
+                current_file_path = "<unknown>"
+            log_rank(
+                f"Dataset {i} ({dataset.folder_path}) is reading from file {current_file_path}",
+                logger=logger,
+                level=logging.INFO,
+                rank=0,
+            )
             # estimate number of tokens needed for this dataset
             needed_num_samples_dataset = int((train_steps - current_iteration) * global_batch_size * weights[i])
             needed_num_tokens_dataset = needed_num_samples_dataset * sequence_length
@@ -710,6 +723,7 @@ def get_tb_dataloader(
             output_pp_rank=output_pp_rank,
             parallel_context=parallel_context,
             tokenizer_name_or_path=tokenizer_name_or_path,
+            feedback_format=sdsp_args.feedback_format,
             feedback_open_tag=sdsp_args.feedback_open_tag,
             feedback_close_tag=sdsp_args.feedback_close_tag,
             strip_single_newline_after_feedback=sdsp_args.strip_single_newline_after_feedback,

@@ -12,6 +12,7 @@ from nanotron.config import Config, ParallelismArgs
 from nanotron.config.models_config import Qwen2Config, RandomInit, SpectralMupInit
 from nanotron.logging import LogMixin, LoggingCollectorMixin, log_rank
 from nanotron.models import NanotronModel
+from nanotron.models.base import init_on_device_and_dtype
 from nanotron.nn.activations import ACT2FN
 from nanotron.nn.attention import ALL_ATTENTION_FUNCTIONS, get_attention_mask
 from nanotron.nn.layer_norm import LlamaRMSNorm as RMSNorm
@@ -865,6 +866,52 @@ def scalar_log_tensor(value: torch.Tensor) -> torch.Tensor:
     return value.detach().reshape(1)
 
 
+@torch.no_grad()
+def _ema_update_in_place(teacher_tensor: torch.Tensor, student_tensor: torch.Tensor, tau: float) -> None:
+    teacher_tensor.mul_(tau).add_(student_tensor, alpha=1.0 - tau)
+
+
+@torch.no_grad()
+def _ema_update_module_(teacher_module: nn.Module, student_module: nn.Module, tau: float) -> None:
+    student_named_parameters = dict(student_module.named_parameters())
+    for name, teacher_param in teacher_module.named_parameters():
+        if name not in student_named_parameters:
+            raise ValueError(f"EMA teacher parameter {name!r} is missing in student module")
+        _ema_update_in_place(teacher_param, student_named_parameters[name], tau=tau)
+
+    student_named_buffers = dict(student_module.named_buffers())
+    for name, teacher_buffer in teacher_module.named_buffers():
+        if name not in student_named_buffers:
+            raise ValueError(f"EMA teacher buffer {name!r} is missing in student module")
+        teacher_buffer.copy_(student_named_buffers[name])
+
+
+def _build_dataset_ntp_log_items(
+    token_nll: torch.Tensor,
+    label_mask: torch.Tensor,
+    sample_dataset_index: Optional[torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    log_items: Dict[str, torch.Tensor] = {
+        "ntp_loss": scalar_log_tensor(masked_mean_or_zero(token_nll, label_mask, dtype=torch.float)),
+    }
+    if sample_dataset_index is None:
+        return log_items
+
+    dataset_indices = sample_dataset_index.to(device=label_mask.device, dtype=torch.long).view(-1)
+    if dataset_indices.numel() != label_mask.shape[0]:
+        return log_items
+
+    for dataset_id_tensor in torch.unique(dataset_indices):
+        dataset_id = int(dataset_id_tensor.item())
+        if dataset_id < 0:
+            continue
+        dataset_rows = dataset_indices == dataset_id
+        dataset_label_mask = label_mask & dataset_rows.unsqueeze(-1)
+        dataset_ntp_loss = masked_mean_or_zero(token_nll, dataset_label_mask, dtype=torch.float)
+        log_items[f"ntp_loss_dataset_{dataset_id}"] = scalar_log_tensor(dataset_ntp_loss)
+    return log_items
+
+
 def _trim_true_mask(mask: torch.Tensor, keep_count: int) -> torch.Tensor:
     if keep_count <= 0:
         return torch.zeros_like(mask, dtype=torch.bool)
@@ -957,17 +1004,73 @@ def _gather_selected_sharded_logits(
     return selected
 
 
+def _unique_union_global_indices(
+    first_global_indices: torch.Tensor,
+    second_global_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    combined_indices = torch.cat([first_global_indices, second_global_indices], dim=-1)
+    sorted_indices, _ = torch.sort(combined_indices, dim=-1)
+
+    is_unique = torch.ones_like(sorted_indices, dtype=torch.bool)
+    is_unique[..., 1:] = sorted_indices[..., 1:] != sorted_indices[..., :-1]
+    unique_counts = is_unique.sum(dim=-1)
+    max_unique = int(unique_counts.max().item())
+    row_count = sorted_indices.shape[0]
+
+    if max_unique == 0:
+        empty_indices = sorted_indices.new_zeros((row_count, 0))
+        empty_mask = torch.zeros((row_count, 0), dtype=torch.bool, device=sorted_indices.device)
+        return empty_indices, empty_mask
+
+    unique_indices = sorted_indices.new_zeros((row_count, max_unique))
+    unique_mask = (
+        torch.arange(max_unique, device=sorted_indices.device).unsqueeze(0) < unique_counts.unsqueeze(-1)
+    )
+
+    unique_positions = (is_unique.cumsum(dim=-1) - 1).to(dtype=torch.long)
+    row_ids = torch.arange(row_count, device=sorted_indices.device).unsqueeze(-1).expand_as(sorted_indices)
+    unique_indices[row_ids[is_unique], unique_positions[is_unique]] = sorted_indices[is_unique]
+    return unique_indices, unique_mask
+
+
 def _approx_sdsp_kl_topk(
     base_sharded_logits: torch.Tensor,
     cond_sharded_logits: torch.Tensor,
     top_k: int,
     group: dist.ProcessGroup,
+    top_k_source: str = "student",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    global_topk_indices = _global_topk_indices_from_sharded_logits(
-        sharded_logits=base_sharded_logits,
-        top_k=top_k,
-        group=group,
-    )
+    if top_k_source == "student":
+        global_topk_indices = _global_topk_indices_from_sharded_logits(
+            sharded_logits=base_sharded_logits,
+            top_k=top_k,
+            group=group,
+        )
+        selected_mask = torch.ones_like(global_topk_indices, dtype=torch.bool)
+    elif top_k_source == "teacher":
+        global_topk_indices = _global_topk_indices_from_sharded_logits(
+            sharded_logits=cond_sharded_logits,
+            top_k=top_k,
+            group=group,
+        )
+        selected_mask = torch.ones_like(global_topk_indices, dtype=torch.bool)
+    elif top_k_source == "student_teacher_union":
+        student_topk_indices = _global_topk_indices_from_sharded_logits(
+            sharded_logits=base_sharded_logits,
+            top_k=top_k,
+            group=group,
+        )
+        teacher_topk_indices = _global_topk_indices_from_sharded_logits(
+            sharded_logits=cond_sharded_logits,
+            top_k=top_k,
+            group=group,
+        )
+        global_topk_indices, selected_mask = _unique_union_global_indices(
+            first_global_indices=student_topk_indices,
+            second_global_indices=teacher_topk_indices,
+        )
+    else:
+        raise ValueError(f"Unknown SDSP top-k source {top_k_source!r}")
 
     base_logsumexp = _sharded_logsumexp(base_sharded_logits, group=group)
     cond_logsumexp = _sharded_logsumexp(cond_sharded_logits, group=group)
@@ -985,15 +1088,15 @@ def _approx_sdsp_kl_topk(
 
     base_topk_log_probs = base_topk_logits.to(dtype=torch.float) - base_logsumexp.unsqueeze(-1)
     cond_topk_log_probs = (cond_topk_logits.to(dtype=torch.float) - cond_logsumexp.unsqueeze(-1)).detach()
-    base_topk_probs = torch.exp(base_topk_log_probs)
-    cond_topk_probs = torch.exp(cond_topk_log_probs)
+    selected_mask_float = selected_mask.to(dtype=torch.float)
+    base_topk_probs = torch.exp(base_topk_log_probs) * selected_mask_float
+    cond_topk_probs = torch.exp(cond_topk_log_probs) * selected_mask_float
 
     topk_kl = (base_topk_probs * (base_topk_log_probs - cond_topk_log_probs)).sum(dim=-1)
 
     local_vocab = base_sharded_logits.shape[-1]
     global_vocab = local_vocab * group.size()
-    effective_k = min(top_k, global_vocab)
-    if effective_k == global_vocab:
+    if bool(torch.all(selected_mask.sum(dim=-1) == global_vocab).item()):
         return topk_kl, base_topk_probs.sum(dim=-1)
 
     eps = 1e-8
@@ -1039,12 +1142,14 @@ class Loss(LogMixin, nn.Module):
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        sample_dataset_index: Optional[torch.Tensor] = None,
         text_label_mask: Optional[torch.Tensor] = None,
         reflection_label_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
         token_nll = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
         loss = masked_mean(token_nll, label_mask, dtype=torch.float)
+        self.tbi_logger(_build_dataset_ntp_log_items(token_nll, label_mask, sample_dataset_index))
         self._log_split_losses(
             token_nll=token_nll,
             label_mask=label_mask,
@@ -1064,6 +1169,7 @@ class LossWithZLoss(Loss):
         sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        sample_dataset_index: Optional[torch.Tensor] = None,
         text_label_mask: Optional[torch.Tensor] = None,
         reflection_label_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -1073,6 +1179,7 @@ class LossWithZLoss(Loss):
         )
         loss = masked_mean(token_nll, label_mask, dtype=torch.float)
         z_loss = masked_mean(z_loss.detach(), label_mask, dtype=torch.float)
+        self.tbi_logger(_build_dataset_ntp_log_items(token_nll, label_mask, sample_dataset_index))
         self._log_split_losses(
             token_nll=token_nll,
             label_mask=label_mask,
@@ -1083,11 +1190,12 @@ class LossWithZLoss(Loss):
 
 
 class SDSPLoss(LogMixin, nn.Module):
-    def __init__(self, tp_pg: dist.ProcessGroup, alpha: float, kl_top_k: int):
+    def __init__(self, tp_pg: dist.ProcessGroup, alpha: float, kl_top_k: int, kl_top_k_source: str):
         super().__init__()
         self.tp_pg = tp_pg
         self.alpha = alpha
         self.kl_top_k = kl_top_k
+        self.kl_top_k_source = kl_top_k_source
 
     def forward(
         self,
@@ -1099,6 +1207,7 @@ class SDSPLoss(LogMixin, nn.Module):
         cond_label_ids: torch.Tensor,
         cond_label_mask: torch.Tensor,
         cond_sdsp_pair_mask: torch.Tensor,
+        sample_dataset_index: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         base_sharded_logits = base_sharded_logits.view(base_label_ids.shape[0], base_label_ids.shape[1], -1)
         cond_sharded_logits = cond_sharded_logits.view(cond_label_ids.shape[0], cond_label_ids.shape[1], -1)
@@ -1129,31 +1238,41 @@ class SDSPLoss(LogMixin, nn.Module):
                 cond_sharded_logits=cond_pair_logits,
                 top_k=self.kl_top_k,
                 group=self.tp_pg,
+                top_k_source=self.kl_top_k_source,
             )
             sdsp_loss = sdsp_token_kl.mean(dtype=torch.float)
+            sdsp_loss_max = sdsp_token_kl.max()
             sdsp_topk_mass_mean = base_topk_mass.mean(dtype=torch.float)
             sdsp_tail_mass_mean = (1.0 - base_topk_mass).mean(dtype=torch.float)
         else:
             zero = ce_text_loss.new_zeros(())
             sdsp_loss = zero
+            sdsp_loss_max = zero
             sdsp_topk_mass_mean = zero
             sdsp_tail_mass_mean = zero
 
         loss = ce_text_loss + self.alpha * sdsp_loss
 
-        self.tbi_logger(
-            {
-                "ce_text_loss": scalar_log_tensor(ce_text_loss),
-                # `ntp_loss` is the plain next-token-prediction CE over all text tokens.
-                "ntp_loss": scalar_log_tensor(ce_text_loss),
-                "non_pair_loss": scalar_log_tensor(non_pair_loss),
-                "sdpo_loss": scalar_log_tensor(sdsp_loss),
-                "lm_loss": scalar_log_tensor(loss),
-                "sdsp_topk_mass_mean": scalar_log_tensor(sdsp_topk_mass_mean),
-                "sdsp_tail_mass_mean": scalar_log_tensor(sdsp_tail_mass_mean),
-                "sdsp_paired_token_count": scalar_log_tensor(base_sdsp_pair_mask.sum().to(dtype=torch.float)),
-            }
-        )
+        log_items: Dict[str, torch.Tensor] = {
+            "ce_text_loss": scalar_log_tensor(ce_text_loss),
+            # `ntp_loss` is the plain next-token-prediction CE over all text tokens.
+            "ntp_loss": scalar_log_tensor(ce_text_loss),
+            "non_pair_loss": scalar_log_tensor(non_pair_loss),
+            "sdpo_loss": scalar_log_tensor(sdsp_loss),
+            "sdpo_loss_max": scalar_log_tensor(sdsp_loss_max),
+            "lm_loss": scalar_log_tensor(loss),
+            "sdsp_topk_mass_mean": scalar_log_tensor(sdsp_topk_mass_mean),
+            "sdsp_tail_mass_mean": scalar_log_tensor(sdsp_tail_mass_mean),
+            "sdsp_paired_token_count": scalar_log_tensor(base_sdsp_pair_mask.sum().to(dtype=torch.float)),
+        }
+        for key, value in _build_dataset_ntp_log_items(
+            token_nll=base_nll,
+            label_mask=base_label_mask,
+            sample_dataset_index=sample_dataset_index,
+        ).items():
+            log_items[key] = value
+
+        self.tbi_logger(log_items)
 
         return {"loss": loss}
 
@@ -1170,6 +1289,12 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         self.model = Qwen2Model(config=config, parallel_context=parallel_context, parallel_config=parallel_config)
         self.sdsp = getattr(config, "sdsp", None)
         self.split_feedback_loss_logging = os.environ.get("SPLIT_FEEDBACK_LOSS_LOGGING", "0") == "1"
+        self._sdsp_ema_teacher_enabled = bool(
+            self.sdsp is not None and getattr(self.sdsp, "ema_teacher_enabled", False)
+        )
+        self._sdsp_ema_teacher_tau = float(getattr(self.sdsp, "ema_teacher_tau", 0.999))
+        # Keep EMA teacher outside module registration to avoid optimizer/checkpoint schema changes.
+        self.__dict__["_sdsp_ema_teacher_model"] = None
 
         # Choose the appropriate loss class based on config
         loss_kwargs = {
@@ -1189,6 +1314,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                     "tp_pg": parallel_context.tp_pg,
                     "alpha": self.sdsp.alpha,
                     "kl_top_k": self.sdsp.kl_top_k,
+                    "kl_top_k_source": self.sdsp.kl_top_k_source,
                 },
                 module_input_keys={
                     "base_sharded_logits",
@@ -1199,6 +1325,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                     "cond_label_ids",
                     "cond_label_mask",
                     "cond_sdsp_pair_mask",
+                    "sample_dataset_index",
                 },
                 module_output_keys={"loss"},
             )
@@ -1207,6 +1334,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                 "sharded_logits",
                 "label_ids",
                 "label_mask",
+                "sample_dataset_index",
             }
             if self.split_feedback_loss_logging:
                 non_sdsp_loss_input_keys |= {"text_label_mask", "reflection_label_mask"}
@@ -1220,6 +1348,78 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         self.parallel_context = parallel_context
         self.config = config
         self.parallel_config = parallel_config
+
+    def _build_sdsp_ema_teacher_model(self) -> Qwen2Model:
+        teacher_model = Qwen2Model(
+            config=self.config,
+            parallel_context=self.parallel_context,
+            parallel_config=self.parallel_config,
+        )
+
+        student_pipeline_blocks = {
+            name: module for name, module in self.model.named_modules() if isinstance(module, PipelineBlock)
+        }
+        student_params = list(self.model.parameters())
+        if not student_params:
+            raise RuntimeError("Cannot initialize SDSP EMA teacher because the student model has no parameters.")
+
+        with init_on_device_and_dtype(device=student_params[0].device, dtype=student_params[0].dtype):
+            for name, module in teacher_model.named_modules():
+                if not isinstance(module, PipelineBlock):
+                    continue
+                if name not in student_pipeline_blocks:
+                    raise RuntimeError(f"Cannot initialize SDSP EMA teacher: missing student pipeline block {name!r}")
+                student_block = student_pipeline_blocks[name]
+                if not hasattr(student_block, "rank"):
+                    raise RuntimeError(
+                        f"Cannot initialize SDSP EMA teacher: student pipeline block {name!r} has no assigned rank"
+                    )
+                module.build_and_set_rank(student_block.rank)
+
+        student_named_parameters = dict(self.model.named_parameters())
+        # Keep teacher parameter structure aligned with student in tied-embedding setups.
+        if (
+            "lm_head.pp_block.weight" not in student_named_parameters
+            and "token_position_embeddings.pp_block.token_embedding.weight" in student_named_parameters
+            and hasattr(teacher_model.lm_head, "pp_block")
+            and hasattr(teacher_model.token_position_embeddings, "pp_block")
+        ):
+            teacher_model.lm_head.pp_block.weight = teacher_model.token_position_embeddings.pp_block.token_embedding.weight
+
+        _ema_update_module_(teacher_module=teacher_model, student_module=self.model, tau=0.0)
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad_(False)
+        return teacher_model
+
+    def _sync_sdsp_ema_teacher_pipeline_state(self, teacher_model: Qwen2Model) -> None:
+        student_pipeline_blocks = {
+            name: module for name, module in self.model.named_modules() if isinstance(module, PipelineBlock)
+        }
+        for name, module in teacher_model.named_modules():
+            if not isinstance(module, PipelineBlock):
+                continue
+            student_block = student_pipeline_blocks.get(name)
+            if student_block is None:
+                raise RuntimeError(f"Cannot sync SDSP EMA teacher pipeline state: missing block {name!r}")
+            module.set_pipeline_state(student_block.pipeline_state)
+
+    def _get_sdsp_ema_teacher_model(self) -> Qwen2Model:
+        teacher_model = self.__dict__.get("_sdsp_ema_teacher_model")
+        if teacher_model is None:
+            teacher_model = self._build_sdsp_ema_teacher_model()
+            self.__dict__["_sdsp_ema_teacher_model"] = teacher_model
+        self._sync_sdsp_ema_teacher_pipeline_state(teacher_model=teacher_model)
+        return teacher_model
+
+    @torch.no_grad()
+    def after_optimizer_step(self) -> None:
+        if not self._sdsp_ema_teacher_enabled:
+            return
+        teacher_model = self.__dict__.get("_sdsp_ema_teacher_model")
+        if teacher_model is None:
+            return
+        _ema_update_module_(teacher_module=teacher_model, student_module=self.model, tau=self._sdsp_ema_teacher_tau)
 
     def forward(
         self,
@@ -1237,6 +1437,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         cond_label_ids: Optional[Union[torch.Tensor, TensorPointer]] = None,
         cond_label_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
         cond_sdsp_pair_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
+        sample_dataset_index: Optional[Union[torch.Tensor, TensorPointer]] = None,
         text_label_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
         reflection_label_mask: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
@@ -1261,10 +1462,18 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                 input_ids=base_input_ids,
                 position_ids=base_position_ids,
             )
-            cond_sharded_logits = self.model(
-                input_ids=cond_input_ids,
-                position_ids=cond_position_ids,
-            )
+            if self._sdsp_ema_teacher_enabled:
+                ema_teacher_model = self._get_sdsp_ema_teacher_model()
+                with torch.no_grad():
+                    cond_sharded_logits = ema_teacher_model(
+                        input_ids=cond_input_ids,
+                        position_ids=cond_position_ids,
+                    )
+            else:
+                cond_sharded_logits = self.model(
+                    input_ids=cond_input_ids,
+                    position_ids=cond_position_ids,
+                )
             loss = self.loss(
                 base_sharded_logits=base_sharded_logits,
                 cond_sharded_logits=cond_sharded_logits,
@@ -1274,6 +1483,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
                 cond_label_ids=cond_label_ids,
                 cond_label_mask=cond_label_mask,
                 cond_sdsp_pair_mask=cond_sdsp_pair_mask,
+                sample_dataset_index=sample_dataset_index,
             )
             return {"loss": loss["loss"]}
 
@@ -1285,6 +1495,7 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
             "sharded_logits": sharded_logits,
             "label_ids": label_ids,
             "label_mask": label_mask,
+            "sample_dataset_index": sample_dataset_index,
         }
         if self.split_feedback_loss_logging:
             if text_label_mask is None or reflection_label_mask is None:

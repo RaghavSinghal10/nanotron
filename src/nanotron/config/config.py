@@ -354,6 +354,13 @@ class TokensArgs:
 class SDSPArgs:
     alpha: float
     kl_top_k: int = 200
+    # `student` -> top-k from base/student logits (current behavior)
+    # `teacher` -> top-k from cond/teacher logits
+    # `student_teacher_union` -> union of both top-k sets
+    kl_top_k_source: str = "student"
+    ema_teacher_enabled: bool = False
+    ema_teacher_tau: float = 0.999
+    feedback_format: str = "assistant_xml"
     feedback_open_tag: str = "<assistant>"
     feedback_close_tag: str = "</assistant>"
     strip_single_newline_after_feedback: bool = True
@@ -363,10 +370,30 @@ class SDSPArgs:
             raise ValueError(f"sdsp.alpha must be >= 0, got {self.alpha}")
         if self.kl_top_k <= 0:
             raise ValueError(f"sdsp.kl_top_k must be > 0, got {self.kl_top_k}")
-        if not self.feedback_open_tag:
-            raise ValueError("sdsp.feedback_open_tag must be non-empty")
-        if not self.feedback_close_tag:
-            raise ValueError("sdsp.feedback_close_tag must be non-empty")
+        if self.kl_top_k_source == "both":
+            self.kl_top_k_source = "student_teacher_union"
+        valid_kl_top_k_sources = {"student", "teacher", "student_teacher_union"}
+        if self.kl_top_k_source not in valid_kl_top_k_sources:
+            raise ValueError(
+                "sdsp.kl_top_k_source must be one of "
+                f"{sorted(valid_kl_top_k_sources)} and not {self.kl_top_k_source!r}"
+            )
+        if self.ema_teacher_enabled and not (0.0 < self.ema_teacher_tau < 1.0):
+            raise ValueError(
+                "sdsp.ema_teacher_tau must satisfy 0.0 < tau < 1.0 when sdsp.ema_teacher_enabled is true, "
+                f"got {self.ema_teacher_tau}"
+            )
+        valid_feedback_formats = {"assistant_xml", "reflection_newline"}
+        if self.feedback_format not in valid_feedback_formats:
+            raise ValueError(
+                "sdsp.feedback_format must be one of "
+                f"{sorted(valid_feedback_formats)} and not {self.feedback_format!r}"
+            )
+        if self.feedback_format == "assistant_xml":
+            if not self.feedback_open_tag:
+                raise ValueError("sdsp.feedback_open_tag must be non-empty")
+            if not self.feedback_close_tag:
+                raise ValueError("sdsp.feedback_close_tag must be non-empty")
 
 
 @dataclass

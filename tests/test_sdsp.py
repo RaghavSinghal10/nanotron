@@ -1,8 +1,10 @@
+import pytest
 import numpy as np
 import torch
 
+from nanotron.config.config import SDSPArgs
 from nanotron.data.clm_collator import DataCollatorForSDSPWithPositionIds
-from nanotron.models.qwen import _normalize_sdsp_pair_masks
+from nanotron.models.qwen import _ema_update_in_place, _normalize_sdsp_pair_masks
 
 
 class _FakeTokenizer:
@@ -22,8 +24,16 @@ class _FakeTokenizer:
             3: ">",
             4: "</",
             5: "\n",
+            6: ".Ċ",
         }
         return [mapping.get(token_id, f"tok_{token_id}") for token_id in ids]
+
+    def decode(self, ids, clean_up_tokenization_spaces=False):
+        token_to_text = {
+            5: "\n",
+            6: ".\n",
+        }
+        return "".join(token_to_text.get(token_id, f"tok_{token_id}") for token_id in ids)
 
 
 class _FakeParallelContext:
@@ -66,6 +76,159 @@ def test_sdsp_collator_excludes_each_doc_first_text_token_from_pair_mask(monkeyp
 
     assert int(result["base_sdsp_pair_mask"].sum()) == 5
     assert int(result["cond_sdsp_pair_mask"].sum()) == 5
+
+
+def test_sdsp_collator_reflection_newline_pairs_tokens(monkeypatch):
+    monkeypatch.setattr(
+        "nanotron.data.clm_collator.AutoTokenizer.from_pretrained",
+        lambda _: _FakeTokenizer(),
+    )
+    collator = DataCollatorForSDSPWithPositionIds(
+        sequence_length=16,
+        input_pp_rank=0,
+        output_pp_rank=0,
+        parallel_context=None,
+        tokenizer_name_or_path="fake",
+        feedback_format="reflection_newline",
+        eos_token_id=99,
+    )
+
+    # Two docs in reflection_newline format:
+    # doc1: [11, 12, \\n, 21, 22, 23, EOS] -> 2 paired tokens
+    # doc2: [13, \\n, 24, 25, EOS]          -> 1 paired token
+    packed = np.asarray([11, 12, 5, 21, 22, 23, 99, 13, 5, 24, 25, 99], dtype=np.int64)
+    positions = np.arange(len(packed), dtype=np.int64)
+
+    result = collator._build_sdsp_example(input_ids=packed, positions=positions)
+
+    assert int(result["base_sdsp_pair_mask"].sum()) == 3
+    assert int(result["cond_sdsp_pair_mask"].sum()) == 3
+
+
+def test_sdsp_collator_reflection_newline_without_boundary_has_zero_pairs(monkeypatch):
+    monkeypatch.setattr(
+        "nanotron.data.clm_collator.AutoTokenizer.from_pretrained",
+        lambda _: _FakeTokenizer(),
+    )
+    collator = DataCollatorForSDSPWithPositionIds(
+        sequence_length=12,
+        input_pp_rank=0,
+        output_pp_rank=0,
+        parallel_context=None,
+        tokenizer_name_or_path="fake",
+        feedback_format="reflection_newline",
+        eos_token_id=99,
+    )
+
+    packed = np.asarray([11, 12, 13, 99, 14, 15, 16, 99], dtype=np.int64)
+    positions = np.arange(len(packed), dtype=np.int64)
+    result = collator._build_sdsp_example(input_ids=packed, positions=positions)
+
+    assert int(result["base_sdsp_pair_mask"].sum()) == 0
+    assert int(result["cond_sdsp_pair_mask"].sum()) == 0
+
+
+def test_sdsp_collator_reflection_newline_with_merged_newline_piece_pairs_tokens(monkeypatch):
+    monkeypatch.setattr(
+        "nanotron.data.clm_collator.AutoTokenizer.from_pretrained",
+        lambda _: _FakeTokenizer(),
+    )
+    collator = DataCollatorForSDSPWithPositionIds(
+        sequence_length=12,
+        input_pp_rank=0,
+        output_pp_rank=0,
+        parallel_context=None,
+        tokenizer_name_or_path="fake",
+        feedback_format="reflection_newline",
+        eos_token_id=99,
+    )
+
+    # Newline is merged into token id 6 (".Ċ"), so encode("\n")==[5] is absent.
+    # doc: [11, 12, .\\n, 21, 22, EOS] -> text tokens [21, 22, EOS]
+    # first text token is CE-only, second text token is SDSP-paired, EOS not paired.
+    packed = np.asarray([11, 12, 6, 21, 22, 99], dtype=np.int64)
+    positions = np.arange(len(packed), dtype=np.int64)
+    result = collator._build_sdsp_example(input_ids=packed, positions=positions)
+
+    assert int(result["base_sdsp_pair_mask"].sum()) == 1
+    assert int(result["cond_sdsp_pair_mask"].sum()) == 1
+
+
+def test_sdsp_collator_includes_real_eos_in_base_ce_but_not_padded_eos(monkeypatch):
+    monkeypatch.setattr(
+        "nanotron.data.clm_collator.AutoTokenizer.from_pretrained",
+        lambda _: _FakeTokenizer(),
+    )
+    collator = DataCollatorForSDSPWithPositionIds(
+        sequence_length=32,
+        input_pp_rank=0,
+        output_pp_rank=0,
+        parallel_context=None,
+        tokenizer_name_or_path="fake",
+        feedback_open_tag="<assistant>",
+        feedback_close_tag="</assistant>",
+        strip_single_newline_after_feedback=True,
+        eos_token_id=99,
+    )
+
+    packed = np.asarray(
+        [
+            1, 2, 3, 11, 12, 4, 2, 3, 5, 21, 22, 23, 99,
+            1, 2, 3, 13, 4, 2, 3, 5, 24, 25, 26, 27, 99,
+        ],
+        dtype=np.int64,
+    )
+    positions = np.arange(len(packed), dtype=np.int64)
+    result = collator._build_sdsp_example(input_ids=packed, positions=positions)
+
+    base_label_ids = result["base_label_ids"]
+    base_label_mask = result["base_label_mask"]
+    eos_target_mask = base_label_ids == 99
+
+    # Real document EOS targets should be supervised.
+    assert int((eos_target_mask & base_label_mask).sum()) == 2
+    # Padded EOS targets should stay masked out.
+    assert int((eos_target_mask & (~base_label_mask)).sum()) > 0
+    # SDSP pairing behavior stays unchanged for this fixture.
+    assert int(result["base_sdsp_pair_mask"].sum()) == 5
+    assert int(result["cond_sdsp_pair_mask"].sum()) == 5
+
+
+def test_sdsp_collator_masks_shifted_doc_boundary_tokens_in_base_ce(monkeypatch):
+    monkeypatch.setattr(
+        "nanotron.data.clm_collator.AutoTokenizer.from_pretrained",
+        lambda _: _FakeTokenizer(),
+    )
+    collator = DataCollatorForSDSPWithPositionIds(
+        sequence_length=32,
+        input_pp_rank=0,
+        output_pp_rank=0,
+        parallel_context=None,
+        tokenizer_name_or_path="fake",
+        feedback_open_tag="<assistant>",
+        feedback_close_tag="</assistant>",
+        strip_single_newline_after_feedback=True,
+        eos_token_id=99,
+    )
+
+    packed = np.asarray(
+        [
+            1, 2, 3, 11, 12, 4, 2, 3, 5, 21, 22, 23, 99,
+            1, 2, 3, 13, 4, 2, 3, 5, 24, 25, 26, 27, 99,
+        ],
+        dtype=np.int64,
+    )
+    positions = np.arange(len(packed), dtype=np.int64)
+    result = collator._build_sdsp_example(input_ids=packed, positions=positions)
+
+    base_label_ids = result["base_label_ids"]
+    base_label_mask = result["base_label_mask"]
+
+    # `24` is the first text token of doc2 in the base stream; with shifted
+    # boundary masking it should not contribute to CE.
+    assert int(((base_label_ids == 24) & (~base_label_mask)).sum()) == 1
+    # Neighboring non-boundary text token is still supervised.
+    assert int(((base_label_ids == 25) & base_label_mask).sum()) == 1
 
 
 def test_sdsp_collator_fallback_positions_reset_after_eos(monkeypatch):
@@ -147,3 +310,31 @@ def test_sdsp_pair_mask_normalization_keeps_order_aligned_masks():
 
     assert torch.equal(normalized_base, base_sdsp_pair_mask)
     assert torch.equal(normalized_cond, cond_sdsp_pair_mask)
+
+
+def test_sdsp_args_ema_teacher_defaults_preserve_old_behavior():
+    args = SDSPArgs(alpha=1.0)
+    assert args.ema_teacher_enabled is False
+    assert args.ema_teacher_tau == 0.999
+
+
+def test_sdsp_args_ema_teacher_tau_validation():
+    args = SDSPArgs(alpha=1.0, ema_teacher_enabled=True, ema_teacher_tau=0.9)
+    assert args.ema_teacher_enabled is True
+    assert args.ema_teacher_tau == 0.9
+
+    with pytest.raises(ValueError):
+        SDSPArgs(alpha=1.0, ema_teacher_enabled=True, ema_teacher_tau=0.0)
+    with pytest.raises(ValueError):
+        SDSPArgs(alpha=1.0, ema_teacher_enabled=True, ema_teacher_tau=1.0)
+
+
+def test_ema_update_in_place_matches_formula():
+    teacher = torch.tensor([2.0, 4.0, 6.0], dtype=torch.float32)
+    student = torch.tensor([10.0, 20.0, 30.0], dtype=torch.float32)
+    tau = 0.9
+
+    _ema_update_in_place(teacher_tensor=teacher, student_tensor=student, tau=tau)
+
+    expected = torch.tensor([2.8, 5.6, 8.4], dtype=torch.float32)
+    assert torch.allclose(teacher, expected)

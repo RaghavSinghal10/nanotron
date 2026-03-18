@@ -717,6 +717,9 @@ class DistributedTrainer:
         nanotron_timer("optimizer_step", "cuda").start()
         self.optimizer.step()
         self.optimizer.zero_grad()
+        after_optimizer_step_hook = getattr(self.unwrapped_model, "after_optimizer_step", None)
+        if callable(after_optimizer_step_hook):
+            after_optimizer_step_hook()
         nanotron_timer("optimizer_step", "cuda").end()
 
         # Update the learning rate
@@ -865,8 +868,13 @@ class DistributedTrainer:
                 # Names may be namespaced (e.g. "loss.pp_block/ntp_loss"), so match suffix.
                 if name == "ntp_loss" or name.endswith("/ntp_loss"):
                     basic_log_entries.append(LogItem("ntp_loss", tensor.mean().item(), "human_format"))
+                elif name.startswith("ntp_loss_dataset_") or "/ntp_loss_dataset_" in name:
+                    metric_name = name.split("/")[-1]
+                    basic_log_entries.append(LogItem(metric_name, tensor.mean().item(), "human_format"))
                 elif name == "sdpo_loss" or name.endswith("/sdpo_loss"):
                     basic_log_entries.append(LogItem("sdpo_loss", tensor.mean().item(), "human_format"))
+                elif name == "sdpo_loss_max" or name.endswith("/sdpo_loss_max"):
+                    basic_log_entries.append(LogItem("sdpo_loss_max", tensor.mean().item(), "human_format"))
                 elif name == "text_loss" or name.endswith("/text_loss"):
                     basic_log_entries.append(LogItem("text_loss", tensor.mean().item(), "human_format"))
                 elif name == "reflection_loss" or name.endswith("/reflection_loss"):

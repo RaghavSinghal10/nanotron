@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -46,6 +47,7 @@ class DataCollatorForCLM:
                 "input_mask": TensorPointer(group_rank=self.input_pp_rank),
                 "label_ids": TensorPointer(group_rank=self.output_pp_rank),
                 "label_mask": TensorPointer(group_rank=self.output_pp_rank),
+                "sample_dataset_index": TensorPointer(group_rank=self.output_pp_rank),
             }
 
         # TODO @nouamanetazi: Is it better to have examples as np.array or torch.Tensor?
@@ -58,6 +60,7 @@ class DataCollatorForCLM:
         result["input_mask"] = TensorPointer(group_rank=self.input_pp_rank)
         result["label_ids"] = TensorPointer(group_rank=self.output_pp_rank)
         result["label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
+        result["sample_dataset_index"] = TensorPointer(group_rank=self.output_pp_rank)
 
         assert (
             expanded_input_length == self.sequence_length + 1
@@ -79,6 +82,10 @@ class DataCollatorForCLM:
         # Process labels: shift them to the left
         if current_pp_rank == self.output_pp_rank:
             result["label_ids"] = input_ids[:, 1:]
+            sample_dataset_indices = np.asarray(
+                [int(examples[i].get("_dataset_index", -1)) for i in range(len(examples))],
+                dtype=np.int64,
+            )
 
             # Create label mask based on position_ids
             if "positions" in examples[0]:
@@ -104,6 +111,7 @@ class DataCollatorForCLM:
             )
             result["label_ids"] = result["label_ids"][:, local_slice]  # (b, s/cp_size)
             result["label_mask"] = result["label_mask"][:, local_slice]  # (b, s/cp_size)
+            result["sample_dataset_index"] = sample_dataset_indices
 
         if (
             not isinstance(result["input_ids"], TensorPointer)
@@ -293,6 +301,7 @@ class DataCollatorForCLMWithPositionIds:
                 "positions": TensorPointer(group_rank=self.input_pp_rank),
                 "label_ids": TensorPointer(group_rank=self.output_pp_rank),
                 "label_mask": TensorPointer(group_rank=self.output_pp_rank),
+                "sample_dataset_index": TensorPointer(group_rank=self.output_pp_rank),
             }
             if self.split_feedback_loss_logging:
                 result["text_label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
@@ -337,6 +346,7 @@ class DataCollatorForCLMWithPositionIds:
         result["position_ids"] = TensorPointer(group_rank=self.input_pp_rank)
         result["label_ids"] = TensorPointer(group_rank=self.output_pp_rank)
         result["label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
+        result["sample_dataset_index"] = TensorPointer(group_rank=self.output_pp_rank)
         if self.split_feedback_loss_logging:
             result["text_label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
             result["reflection_label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
@@ -381,6 +391,10 @@ class DataCollatorForCLMWithPositionIds:
         # Process labels
         if current_pp_rank == self.output_pp_rank:
             result["label_ids"] = input_ids[:, 1:]
+            sample_dataset_indices = np.asarray(
+                [int(examples[i].get("_dataset_index", -1)) for i in range(len(examples))],
+                dtype=np.int64,
+            )
 
             # Create label mask based on position_ids
             if position_ids is not None:
@@ -410,6 +424,7 @@ class DataCollatorForCLMWithPositionIds:
             if self.split_feedback_loss_logging:
                 result["text_label_mask"] = result["text_label_mask"][:, local_slice]
                 result["reflection_label_mask"] = result["reflection_label_mask"][:, local_slice]
+            result["sample_dataset_index"] = sample_dataset_indices
 
         # Validate shapes
         if (
@@ -449,8 +464,9 @@ class DataCollatorForSDSPWithPositionIds:
     Data collator for SDSP-style pretraining.
 
     It emits two aligned autoregressive views per sample:
-    - `cond_*`: the original feedback + text EPE sequence
-    - `base_*`: a text-only sequence obtained by removing the leading assistant-tag feedback
+    - `cond_*`: the original feedback + text sequence
+    - `base_*`: a text-only sequence obtained by removing the configured feedback prefix
+      (`assistant_xml` tags or `reflection_newline` prefix)
 
     `*_sdsp_pair_mask` marks aligned text targets that can participate in the SDSP correction.
     """
@@ -460,14 +476,48 @@ class DataCollatorForSDSPWithPositionIds:
     output_pp_rank: int
     parallel_context: ParallelContext
     tokenizer_name_or_path: str
-    feedback_open_tag: str
-    feedback_close_tag: str
+    feedback_format: str = "assistant_xml"
+    feedback_open_tag: str = "<assistant>"
+    feedback_close_tag: str = "</assistant>"
     strip_single_newline_after_feedback: bool = True
     eos_token_id: Optional[int] = None
     cp_return_global_position_ids: bool = True
 
     def __post_init__(self):
         self._get_tokenizer()
+        self._sdsp_enabled_dataset_indices = self._parse_sdsp_enabled_dataset_indices()
+
+    def _parse_sdsp_enabled_dataset_indices(self) -> Optional[Tuple[int, ...]]:
+        raw = os.environ.get("SDSP_ENABLE_DATASET_INDICES", "").strip()
+        if raw == "":
+            return None
+        indices: List[int] = []
+        for part in raw.split(","):
+            token = part.strip()
+            if token == "":
+                continue
+            try:
+                indices.append(int(token))
+            except ValueError as exc:
+                raise ValueError(
+                    "Invalid SDSP_ENABLE_DATASET_INDICES value. "
+                    f"Expected comma-separated integers, got: {raw!r}"
+                ) from exc
+        if not indices:
+            return tuple()
+        # Preserve order while deduplicating.
+        deduped = tuple(dict.fromkeys(indices))
+        return deduped
+
+    def _sample_allows_sdsp(self, dataset_index: Optional[int]) -> bool:
+        # Backward-compatible default: if gating is not configured, keep previous behavior.
+        if self._sdsp_enabled_dataset_indices is None:
+            return True
+        # If gating is configured but source index is unavailable, do not gate to avoid
+        # changing behavior in non-blended/single-dataset pipelines.
+        if dataset_index is None:
+            return True
+        return int(dataset_index) in self._sdsp_enabled_dataset_indices
 
     def _get_tokenizer(self):
         tokenizer = getattr(self, "_tokenizer", None)
@@ -475,29 +525,41 @@ class DataCollatorForSDSPWithPositionIds:
             return tokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_or_path)
-        open_pieces = tokenizer.convert_ids_to_tokens(
-            tokenizer.encode(self.feedback_open_tag, add_special_tokens=False)
-        )
-        close_pieces = tokenizer.convert_ids_to_tokens(
-            tokenizer.encode(self.feedback_close_tag, add_special_tokens=False)
-        )
         newline_tokens = tokenizer.encode("\n", add_special_tokens=False)
+        if len(newline_tokens) == 0:
+            raise ValueError("Newline tokenization unexpectedly returned no ids")
 
-        if len(open_pieces) < 3:
-            raise ValueError(
-                f"Feedback open tag {self.feedback_open_tag!r} tokenized unexpectedly: {open_pieces}"
+        if self.feedback_format == "assistant_xml":
+            open_pieces = tokenizer.convert_ids_to_tokens(
+                tokenizer.encode(self.feedback_open_tag, add_special_tokens=False)
             )
-        if len(close_pieces) < 3:
+            close_pieces = tokenizer.convert_ids_to_tokens(
+                tokenizer.encode(self.feedback_close_tag, add_special_tokens=False)
+            )
+
+            if len(open_pieces) < 3:
+                raise ValueError(
+                    f"Feedback open tag {self.feedback_open_tag!r} tokenized unexpectedly: {open_pieces}"
+                )
+            if len(close_pieces) < 3:
+                raise ValueError(
+                    f"Feedback close tag {self.feedback_close_tag!r} tokenized unexpectedly: {close_pieces}"
+                )
+
+            self._open_first_piece = open_pieces[0]
+            self._assistant_piece = open_pieces[1]
+            self._open_last_piece_prefix = open_pieces[2]
+            self._close_last_piece_prefix = close_pieces[-1]
+        elif self.feedback_format != "reflection_newline":
             raise ValueError(
-                f"Feedback close tag {self.feedback_close_tag!r} tokenized unexpectedly: {close_pieces}"
+                f"Unsupported SDSP feedback format: {self.feedback_format!r}. "
+                "Expected one of {'assistant_xml', 'reflection_newline'}."
             )
 
         self._tokenizer = tokenizer
-        self._open_first_piece = open_pieces[0]
-        self._assistant_piece = open_pieces[1]
-        self._open_last_piece_prefix = open_pieces[2]
-        self._close_last_piece_prefix = close_pieces[-1]
+        self._newline_token_ids = tuple(int(tok) for tok in newline_tokens)
         self._newline_token_id = newline_tokens[0] if len(newline_tokens) == 1 else None
+        self._newline_token_contains_cache: Dict[int, bool] = {}
         return tokenizer
 
     def _has_feedback_prefix(self, pieces: List[str]) -> bool:
@@ -518,6 +580,82 @@ class DataCollatorForSDSPWithPositionIds:
                 return idx + 2
         return None
 
+    def _token_contains_newline(
+        self,
+        token_id: int,
+        tokenizer,
+        token_piece: Optional[str] = None,
+    ) -> bool:
+        cached = self._newline_token_contains_cache.get(int(token_id))
+        if cached is not None:
+            return cached
+
+        if token_piece is None:
+            token_piece = tokenizer.convert_ids_to_tokens([int(token_id)])[0]
+
+        # Common textual forms for newline in token pieces:
+        # - literal "\n"
+        # - GPT2/byte-BPE marker "Ċ"
+        # - byte fallback marker "<0x0A>"
+        contains_newline = (
+            ("\n" in token_piece)
+            or ("Ċ" in token_piece)
+            or ("<0x0A>" in token_piece)
+        )
+
+        if not contains_newline:
+            # Robust fallback across tokenizers where newline can be embedded in
+            # merged tokens (e.g. punctuation+newline).
+            try:
+                decoded_piece = tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
+            except TypeError:
+                decoded_piece = tokenizer.decode([int(token_id)])
+            contains_newline = "\n" in decoded_piece
+
+        self._newline_token_contains_cache[int(token_id)] = contains_newline
+        return contains_newline
+
+    def _find_first_newline_end(self, token_ids: List[int], tokenizer) -> Optional[int]:
+        newline = self._newline_token_ids
+        width = len(newline)
+        for idx in range(0, len(token_ids) - width + 1):
+            if tuple(token_ids[idx : idx + width]) == newline:
+                return idx + width - 1
+
+        # Fallback for merged newline pieces where encode("\n") does not appear
+        # as a standalone id sequence (e.g. token ".Ċ").
+        token_pieces = tokenizer.convert_ids_to_tokens(token_ids)
+        for idx, (token_id, token_piece) in enumerate(zip(token_ids, token_pieces)):
+            if self._token_contains_newline(token_id=token_id, tokenizer=tokenizer, token_piece=token_piece):
+                return idx
+        return None
+
+    def _detect_text_start(self, doc_tokens: List[int], tokenizer) -> tuple[bool, int]:
+        if self.feedback_format == "assistant_xml":
+            pieces = tokenizer.convert_ids_to_tokens(doc_tokens)
+            if not self._has_feedback_prefix(pieces):
+                return False, 0
+            feedback_end = self._find_feedback_end(pieces)
+            if feedback_end is None:
+                return False, 0
+            text_start = feedback_end + 1
+            if (
+                self.strip_single_newline_after_feedback
+                and self._newline_token_id is not None
+                and text_start < len(doc_tokens)
+                and doc_tokens[text_start] == self._newline_token_id
+            ):
+                text_start += 1
+            return True, text_start
+
+        newline_end = self._find_first_newline_end(doc_tokens, tokenizer=tokenizer)
+        if newline_end is None:
+            return False, 0
+        text_start = newline_end + 1
+        if text_start >= len(doc_tokens):
+            return False, 0
+        return True, text_start
+
     def _build_fallback_positions(self, input_ids: np.ndarray) -> np.ndarray:
         # Reconstruct packed-document position resets when explicit positions are absent.
         # If EOS is unavailable, fall back to a monotonic arange.
@@ -534,10 +672,16 @@ class DataCollatorForSDSPWithPositionIds:
                 cursor += 1
         return positions
 
-    def _build_sdsp_example(self, input_ids: np.ndarray, positions: np.ndarray) -> Dict[str, np.ndarray]:
+    def _build_sdsp_example(
+        self,
+        input_ids: np.ndarray,
+        positions: np.ndarray,
+        dataset_index: Optional[int] = None,
+    ) -> Dict[str, np.ndarray]:
         tokenizer = self._get_tokenizer()
         token_ids = input_ids.astype(np.int64).tolist()
         position_ids = positions.astype(np.int64).tolist()
+        sample_allows_sdsp = self._sample_allows_sdsp(dataset_index=dataset_index)
 
         doc_starts = [idx for idx, pos in enumerate(position_ids) if pos == 0]
         # Some dataloader variants do not emit per-document position resets (positions are arange fallback).
@@ -569,24 +713,15 @@ class DataCollatorForSDSPWithPositionIds:
 
         for start, end, starts_at_doc_boundary in segments:
             doc_tokens = token_ids[start:end]
-            doc_kinds = [1 if self.eos_token_id is None or tok != self.eos_token_id else 0 for tok in doc_tokens]
+            # Keep document EOS trainable in base CE, matching regular collator behavior.
+            doc_kinds = [1] * len(doc_tokens)
 
             paired = False
             text_start = 0
             if starts_at_doc_boundary and doc_tokens:
-                pieces = tokenizer.convert_ids_to_tokens(doc_tokens)
-                if self._has_feedback_prefix(pieces):
-                    feedback_end = self._find_feedback_end(pieces)
-                    if feedback_end is not None:
-                        paired = True
-                        text_start = feedback_end + 1
-                        if (
-                            self.strip_single_newline_after_feedback
-                            and self._newline_token_id is not None
-                            and text_start < len(doc_tokens)
-                            and doc_tokens[text_start] == self._newline_token_id
-                        ):
-                            text_start += 1
+                paired, text_start = self._detect_text_start(doc_tokens=doc_tokens, tokenizer=tokenizer)
+                if not sample_allows_sdsp:
+                    paired = False
 
             if paired:
                 for rel_idx in range(text_start + 1, len(doc_tokens)):
@@ -601,7 +736,8 @@ class DataCollatorForSDSPWithPositionIds:
                 doc_kinds = []
                 for rel_idx, tok in enumerate(doc_tokens):
                     if self.eos_token_id is not None and tok == self.eos_token_id:
-                        doc_kinds.append(0)
+                        # EOS remains base-only CE and is not SDSP-paired.
+                        doc_kinds.append(1)
                     elif rel_idx == 0:
                         doc_kinds.append(1)
                     else:
@@ -624,6 +760,10 @@ class DataCollatorForSDSPWithPositionIds:
             base_kinds = base_kinds[:target_length]
 
         base_label_mask = np.asarray([kind in (1, 2) for kind in base_kinds[1:]], dtype=np.bool_)
+        # Match regular CLM masking semantics: do not train the first token at each
+        # (shifted) document boundary where position_ids reset to 0.
+        base_label_positions = np.asarray(base_positions[1:], dtype=np.int64)
+        base_label_mask &= base_label_positions != 0
         base_sdsp_pair_mask = np.asarray([kind == 2 for kind in base_kinds[1:]], dtype=np.bool_)
         cond_label_mask = np.asarray([kind == 2 for kind in cond_kinds[1:]], dtype=np.bool_)
         cond_sdsp_pair_mask = cond_label_mask.copy()
@@ -677,17 +817,33 @@ class DataCollatorForSDSPWithPositionIds:
                 "cond_label_ids": TensorPointer(group_rank=self.output_pp_rank),
                 "cond_label_mask": TensorPointer(group_rank=self.output_pp_rank),
                 "cond_sdsp_pair_mask": TensorPointer(group_rank=self.output_pp_rank),
+                "sample_dataset_index": TensorPointer(group_rank=self.output_pp_rank),
             }
 
         processed = []
+        sample_dataset_indices: List[int] = []
         for example in examples:
             input_ids = np.asarray(example["input_ids"])
+            dataset_index = example.get("_dataset_index")
+            if dataset_index is not None:
+                dataset_index = int(dataset_index)
+            else:
+                # Keep backwards compatibility for single-dataset pipelines that do not
+                # expose source indices in the dataloader output.
+                dataset_index = -1
+            sample_dataset_indices.append(dataset_index)
             if "positions" in example:
                 positions = np.asarray(example["positions"])
             else:
                 # Fallback for dataset variants that do not emit explicit positions.
                 positions = self._build_fallback_positions(input_ids=input_ids)
-            processed.append(self._build_sdsp_example(input_ids=input_ids, positions=positions))
+            processed.append(
+                self._build_sdsp_example(
+                    input_ids=input_ids,
+                    positions=positions,
+                    dataset_index=dataset_index,
+                )
+            )
 
         result: Dict[str, Union[np.ndarray, TensorPointer]] = {
             "base_input_ids": TensorPointer(group_rank=self.input_pp_rank),
@@ -700,6 +856,7 @@ class DataCollatorForSDSPWithPositionIds:
             "cond_label_ids": TensorPointer(group_rank=self.output_pp_rank),
             "cond_label_mask": TensorPointer(group_rank=self.output_pp_rank),
             "cond_sdsp_pair_mask": TensorPointer(group_rank=self.output_pp_rank),
+            "sample_dataset_index": TensorPointer(group_rank=self.output_pp_rank),
         }
 
         if current_pp_rank == self.input_pp_rank:
@@ -722,5 +879,6 @@ class DataCollatorForSDSPWithPositionIds:
                 "cond_sdsp_pair_mask",
             ):
                 result[key] = np.vstack([example[key] for example in processed])[:, local_slice]
+            result["sample_dataset_index"] = np.asarray(sample_dataset_indices, dtype=np.int64)
 
         return result

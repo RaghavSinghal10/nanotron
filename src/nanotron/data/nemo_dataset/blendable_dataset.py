@@ -142,8 +142,12 @@ class BlendableDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         dataset_idx = self.dataset_index[idx]
         sample_idx = self.dataset_sample_index[idx]
-
-        return self.datasets[dataset_idx][sample_idx + self.offsets_in_samples[dataset_idx]] # TODO: is it okay to not respect dataset_sample_index? Since it's sequential it's okay for now
+        sample = self.datasets[dataset_idx][sample_idx + self.offsets_in_samples[dataset_idx]] # TODO: is it okay to not respect dataset_sample_index? Since it's sequential it's okay for now
+        if isinstance(sample, dict):
+            # Optional source marker used by SDSP gating in mixed-dataset setups.
+            sample = dict(sample)
+            sample["_dataset_index"] = int(dataset_idx)
+        return sample
 
     # @property
     # def last_file_idx(self):
